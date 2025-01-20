@@ -1,0 +1,217 @@
+#include <OLED_SSD1306_Chart.h>
+
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+
+// Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
+#define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+
+#define BAUDRATE 9600
+
+#define SDA_PIN D1
+#define SCL_PIN D2
+
+OLED_SSD1306_Chart display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+char actualThickness;
+
+// Define heart bitmap (8x8 pixels)
+const uint8_t heartBitmap[] PROGMEM = {
+  0x22, 0x77, 0x7F, 0x7F, 0x3E, 0x3C, 0x18
+};
+
+template <int order> // order is 2 or...
+class BandPass
+{
+  private:
+    float a[order+1];
+    float b[order+1];
+    float omega0;
+    float Q;
+    float domega;
+    float dt;
+    bool adapt;
+    float tn1 = 0;
+    float x[order+1]; // Raw values
+    float y[order+1]; // Filtered values
+
+  public:  
+    BandPass(float f0, float fw, float fs, bool adaptive){
+      omega0 = 6.28318530718*f0;
+      domega = 6.28318530718*fw;
+      Q = omega0/domega;
+      dt = 1.0/fs;
+      adapt = adaptive;
+      tn1 = -dt;
+      for(int k = 0; k < order+1; k++){
+        x[k] = 0;
+        y[k] = 0;      
+        a[k] = 0;
+        b[k] = 0;  
+      }
+      setCoef();
+    }
+
+    void setCoef(){
+      if(adapt){
+        float t = micros()/1.0e6;
+        dt = t - tn1;
+        tn1 = t;
+      }
+      float alpha = omega0*dt;
+      if(order==2){
+        float D = pow(alpha,2) + 2*alpha/Q + 4;
+        b[0] = 2*alpha/(Q*D);
+        b[1] = 0;
+        b[2] = -b[0];
+        a[0] = 0;
+        a[1] = -(2*pow(alpha,2) - 8)/D;
+        a[2] = -(pow(alpha,2) - 2*alpha/Q + 4)/D;  
+      }
+      else if(order==4){
+
+      }
+    }
+    float filt(float xn){
+      if(adapt){
+        setCoef(); // Update coefficients if necessary      
+      }
+      y[0] = 0;
+      x[0] = xn;
+      for(int k = 0; k < order+1; k++){
+        y[0] += a[k]*y[k] + b[k]*x[k];
+      }
+
+      for(int k = order; k > 0; k--){
+        y[k] = y[k-1];
+        x[k] = x[k-1];
+      }
+ 
+      return y[0];
+    }
+};
+
+// Filter instance
+BandPass<2> lp(5,5,970,true);
+
+const int threshold = 1.5;  // Threshold value for detecting peaks
+const int minPeakDistance = 600;  // Minimum distance between peaks in milliseconds
+
+unsigned long lastPeakTime = 0;
+unsigned long startTime = 0;
+int peakCount = 0;
+const int interval = 10000;  // Time interval in milliseconds for BPM calculation (10 seconds)
+
+// Variables for average BPM calculation
+int bpmSum = 0;
+int bpmCount = 0;
+
+void setup() {
+  Serial.begin(9600);
+  startTime = millis();
+#if defined ESP8266
+  Wire.begin(SDA_PIN, SCL_PIN);
+#else
+  Wire.begin();
+#endif
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3c);
+  display.clearDisplay();
+  display.setChartCoordinates(0, 60);      // Chart lower left coordinates (X, Y)
+  display.setChartWidthAndHeight(123, 50); // Chart width = 123 and height = 60
+  display.setXIncrement(10);                // Distance between Y points will be 10px
+  display.setYLimits(0, 100);             // Ymin = 0 and Ymax = 100
+  display.setYLimitLabels("0", "100");    // Setting Y axis labels
+  display.setYLabelsVisible(true);
+  display.setAxisDivisionsInc(12, 6);    // Each 12 px a division will be painted in X axis and each 6px in Y axis
+  display.setPlotMode(SINGLE_PLOT_MODE); // Set single plot mode
+  actualThickness = NORMAL_LINE;
+  display.setLineThickness(actualThickness);
+  display.drawChart(); // Update the buffer to draw the Cartesian chart
+  display.display();
+}
+
+void loop() {
+  // Read the input on analog pin 0:
+  int sensorValue = analogRead(A0);
+  // Convert the analog reading (which goes from 0 - 1023) to a voltage (0 - 5V):
+  float voltage = sensorValue * (5.0 / 1023.0);
+  float ampVol = voltage * 30;
+
+  float yn = lp.filt(ampVol);
+
+  // Peak detection logic
+  if (yn > threshold && yn < 5) {
+    unsigned long currentTime = millis();
+   
+    if (currentTime - lastPeakTime > minPeakDistance) {
+      lastPeakTime = currentTime;
+      peakCount++;
+      Serial.println("Heartbeat detected");
+
+      // Draw the heart indicator
+      display.drawBitmap(SCREEN_WIDTH - 80, 0, heartBitmap, 8, 8, SSD1306_WHITE);
+      display.display(); // Ensure the indicator is updated on the display
+
+      // Keep the indicator visible for a short period
+      delay(50); // Display duration of the indicator (adjust as needed)
+      
+      // Clear the heart indicator
+      display.fillRect(SCREEN_WIDTH - 80, 0, 8, 8, SSD1306_BLACK);
+      display.display(); // Update the display to clear the indicator
+    }
+  }
+
+  // Calculate BPM
+  unsigned long elapsedTime = millis() - startTime;
+  if (elapsedTime >= interval) {
+    int bpm = ((peakCount * 60000) / elapsedTime);
+    Serial.print("BPM: ");
+    Serial.println(bpm);
+   
+    bpmSum += bpm;
+    bpmCount++;
+    float bpmAverage = bpmSum / (float)bpmCount;
+   
+    peakCount = 0;
+    startTime = millis();
+
+    // Clear the top section of the display
+    display.fillRect(0, 0, SCREEN_WIDTH, 10, SSD1306_BLACK); // Clear the top 10 pixels
+
+    // Draw BPM value on top of the graph
+    display.setTextSize(1);       // Text size 1
+    display.setTextColor(SSD1306_WHITE); // White text color
+    display.setCursor(0, 0);      // Set cursor to top-left
+    display.print("BPM: ");
+    display.print(bpm);
+   
+    // Draw average BPM value on the top right of the graph
+    display.setCursor(SCREEN_WIDTH - 60, 0); // Adjust to place it in the upper right corner
+    display.print("Avg: ");
+    display.print(bpmAverage, 1); // Display the average BPM with 1 decimal place
+
+    // Update chart with the new BPM value
+    if (!display.updateChart(bpm)) // Value between Ymin and Ymax will be added to chart
+    {
+      display.clearDisplay(); // Clear the display
+      if (actualThickness == NORMAL_LINE)
+      {
+        actualThickness = LIGHT_LINE;
+      }
+      else if (actualThickness == LIGHT_LINE)
+      {
+        actualThickness = NORMAL_LINE;
+      }
+      display.setLineThickness(actualThickness);
+      display.drawChart();
+
+      bpmSum = 0;
+      bpmCount = 0;
+    }
+
+    display.display(); // Update the display with new content
+  }
+
+  delay(10); // Small delay to stabilize the reading
+}
